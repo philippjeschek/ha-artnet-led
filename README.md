@@ -204,6 +204,31 @@ _Staticly sets the green channel on 50% brightness_
 \* In the case of a white channel being used in an RGB light fixture, the white channel is automatically calculated.
 
 
+### Color mixing (tunable white)
+
+For `color_temp` lights the integration can mix cold white and warm white in two ways, selected per device with `color_mixing`:
+
+- **`max_output`** (default, previous behaviour): the channel ratio is linear in Kelvin and the stronger channel always runs at the set brightness. In the middle of the range both channels are at 100 %, so the light is up to twice as bright there as at the ends, and changing the color temperature also changes the light output.
+- **`constant_lumen`**: cold white + warm white always add up to the set brightness (split linear in mireds, like Home Assistant's own `color_temperature_to_rgbww`). Color temperature and brightness are independent: turning the temperature does not change how bright the light is, dimming does not change the color. The trade-off is that the maximum light output in the middle of the range is half of what the fixture could physically deliver, because each channel only runs at 50 %.
+
+  With `constant_lumen` the `output_correction` curve is applied to the brightness **before** the split, so the total output follows the curve regardless of the color temperature.
+
+- **`boost_entity`** (optional): an entity, usually an `input_boolean`, that temporarily switches the light to `max_output` while it is `on`. Point several lights at the same helper to get a house-wide "full power" / cleaning light switch; lights that are on fade to the new mix immediately.
+
+```yaml
+- channel: 3
+  name: ceiling_cct
+  type: color_temp
+  channel_setup: hc           # first channel warm white, second cold white
+  min_temp: 2500K
+  max_temp: 6500K
+  output_correction: quadratic
+  color_mixing: constant_lumen
+  boost_entity: input_boolean.cleaning_light
+```
+
+The `rgbww` type is not affected by this setting.
+
 ## Supported features
 
 - Color-Mode. 

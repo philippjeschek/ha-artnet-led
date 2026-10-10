@@ -29,6 +29,7 @@ from homeassistant.const import CONF_PORT as CONF_NODE_PORT
 from homeassistant.const import CONF_TYPE as CONF_DEVICE_TYPE
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_registry import async_get
+from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util.color import color_rgb_to_rgbw
 from pyartnet import BaseUniverse, Channel
@@ -37,6 +38,7 @@ from pyartnet.errors import UniverseNotFoundError
 from custom_components.artnet_led.bridge.artnet_controller import ArtNetController
 from custom_components.artnet_led.bridge.channel_bridge import ChannelBridge
 from custom_components.artnet_led.util.channel_switch import validate, to_values, from_values
+from custom_components.artnet_led.util.white_mixing import MIXING_MODES, MIXING_MAX_OUTPUT, MIXING_CONSTANT_LUMEN
 
 ARTNET_DEFAULT_PORT = 6454
 SACN_DEFAULT_PORT = 5568
@@ -64,6 +66,8 @@ CONF_BYTE_ORDER = "byte_order"
 CONF_DEVICE_MIN_TEMP = "min_temp"
 CONF_DEVICE_MAX_TEMP = "max_temp"
 CONF_CHANNEL_SETUP = "channel_setup"
+CONF_COLOR_MIXING = "color_mixing"
+CONF_BOOST_ENTITY = "boost_entity"
 
 DOMAIN = "dmx"
 
@@ -221,9 +225,17 @@ async def async_setup_platform(hass: HomeAssistant, config, async_add_devices, d
                 )
             )
 
-            d.channel.set_output_correction(AVAILABLE_CORRECTIONS.get(
-                device[CONF_OUTPUT_CORRECTION]
-            ))
+            if isinstance(d, DmxWhite) and d.owns_output_correction:
+                # constant_lumen mixing applies the dimming curve to the brightness before splitting it
+                # into cold and warm white. Applying it per channel afterwards would halve the light
+                # output in the middle of the temperature range, so pyartnet is kept linear here.
+                correction_name = device[CONF_OUTPUT_CORRECTION] or universe_cfg[CONF_OUTPUT_CORRECTION] or "linear"
+                d.set_output_correction(AVAILABLE_CORRECTIONS[correction_name])
+                d.channel.set_output_correction(AVAILABLE_CORRECTIONS["linear"])
+            else:
+                d.channel.set_output_correction(AVAILABLE_CORRECTIONS.get(
+                    device[CONF_OUTPUT_CORRECTION]
+                ))
 
             device_list.append(d)
 
@@ -601,6 +613,32 @@ class DmxWhite(DmxBaseLight):
 
         self._channel_width = len(self._channel_setup)
 
+        self._mixing = kwargs.get(CONF_COLOR_MIXING) or MIXING_MAX_OUTPUT
+        self._boost_entity = kwargs.get(CONF_BOOST_ENTITY)
+        self._output_correction_fn = None
+        self._unsub_boost = None
+
+    @property
+    def owns_output_correction(self) -> bool:
+        """True when the dimming curve has to be applied before the cold/warm split."""
+        return self._mixing == MIXING_CONSTANT_LUMEN
+
+    def set_output_correction(self, correction):
+        self._output_correction_fn = correction
+
+    def _effective_mixing(self) -> str:
+        if self._boost_entity and self.hass is not None:
+            boost = self.hass.states.get(self._boost_entity)
+            if boost is not None and boost.state == STATE_ON:
+                return MIXING_MAX_OUTPUT
+        return self._mixing
+
+    @property
+    def extra_state_attributes(self):
+        data = super().extra_state_attributes
+        data["mixing"] = self._effective_mixing()
+        return data
+
     @property
     def color_temp_kelvin(self) -> int | None:
         return self._vals
@@ -617,7 +655,8 @@ class DmxWhite(DmxBaseLight):
 
     def _update_values(self, values: array[int]):
         self._state, self._attr_brightness, _, _, _, _, _, color_temp, _, _ = \
-            from_values(self._channel_setup, self.channel_size[1], values, self._min_kelvin, self._max_kelvin)
+            from_values(self._channel_setup, self.channel_size[1], values, self._min_kelvin, self._max_kelvin,
+                        white_mixing=self._effective_mixing())
         self._vals = color_temp
 
         self._channel_value_change()
@@ -626,7 +665,32 @@ class DmxWhite(DmxBaseLight):
         return to_values(self._channel_setup, self._channel_size[1], self.is_on, self._attr_brightness,
                          color_temp_kelvin=self.color_temp_kelvin,
                          min_kelvin=self.min_color_temp_kelvin,
-                         max_kelvin=self.max_color_temp_kelvin)
+                         max_kelvin=self.max_color_temp_kelvin,
+                         white_mixing=self._effective_mixing(),
+                         output_correction=self._output_correction_fn)
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if self._boost_entity:
+            self._unsub_boost = async_track_state_change_event(
+                self.hass, [self._boost_entity], self._boost_changed)
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._unsub_boost:
+            self._unsub_boost()
+            self._unsub_boost = None
+        await super().async_will_remove_from_hass()
+
+    async def _boost_changed(self, event) -> None:
+        """Re-send the current brightness and temperature with the new mixing when the boost switch flips."""
+        old_state = event.data.get("old_state")
+        new_state = event.data.get("new_state")
+        if new_state is None or (old_state is not None and old_state.state == new_state.state):
+            return
+        if self.is_on:
+            await self.async_create_fade(transition=self._fade_time)
+        else:
+            self.async_schedule_update_ha_state()
 
     async def async_turn_on(self, **kwargs):
         """
@@ -1075,6 +1139,8 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
                             vol.Optional(CONF_CHANNEL_SETUP, default=None): vol.Any(
                                 None, cv.string, cv.ensure_list
                             ),
+                            vol.Optional(CONF_COLOR_MIXING, default=MIXING_MAX_OUTPUT): vol.In(MIXING_MODES),
+                            vol.Optional(CONF_BOOST_ENTITY): cv.entity_id,
                         }
                     ],
                 )
