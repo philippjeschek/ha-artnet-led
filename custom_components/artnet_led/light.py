@@ -29,7 +29,8 @@ from homeassistant.const import CONF_PORT as CONF_NODE_PORT
 from homeassistant.const import CONF_TYPE as CONF_DEVICE_TYPE
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_registry import async_get
-from homeassistant.helpers.event import async_track_state_change_event, async_call_later
+from homeassistant.helpers import entity_platform
+from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util.color import color_rgb_to_rgbw
 from pyartnet import BaseUniverse, Channel
@@ -38,7 +39,7 @@ from pyartnet.errors import UniverseNotFoundError
 from custom_components.artnet_led.bridge.artnet_controller import ArtNetController
 from custom_components.artnet_led.bridge.channel_bridge import ChannelBridge
 from custom_components.artnet_led.util.channel_switch import validate, to_values, from_values
-from custom_components.artnet_led.util.color_source import kelvin_from_state, is_from_source, ManualHold
+from custom_components.artnet_led.util.color_source import kelvin_from_state
 from custom_components.artnet_led.util.white_mixing import MIXING_MODES, MIXING_MAX_OUTPUT, MIXING_CONSTANT_LUMEN
 
 ARTNET_DEFAULT_PORT = 6454
@@ -70,7 +71,8 @@ CONF_CHANNEL_SETUP = "channel_setup"
 CONF_COLOR_MIXING = "color_mixing"
 CONF_BOOST_ENTITY = "boost_entity"
 CONF_COLOR_TEMP_ENTITY = "color_temp_entity"
-CONF_MANUAL_HOLD = "manual_hold"
+
+SERVICE_SET_COLOR_TEMP = "set_color_temp"
 
 DOMAIN = "dmx"
 
@@ -95,6 +97,17 @@ async def async_setup_platform(hass: HomeAssistant, config, async_add_devices, d
     # pyartnet expects the created asyncio task to be the task running its wrapper.
     # Home Assistant's task factory can wrap tasks, which breaks pyartnet's assertions.
     pyartnet.base.background_task.CREATE_TASK = asyncio.create_task
+
+    platform = entity_platform.async_get_current_platform()
+    platform.async_register_entity_service(
+        SERVICE_SET_COLOR_TEMP,
+        {
+            vol.Required(ATTR_COLOR_TEMP_KELVIN): vol.All(vol.Coerce(int), vol.Range(min=1000, max=20000)),
+            vol.Optional(ATTR_BRIGHTNESS): vol.All(vol.Coerce(int), vol.Range(min=1, max=255)),
+            vol.Optional(ATTR_TRANSITION): vol.All(vol.Coerce(float), vol.Range(min=0)),
+        },
+        "async_set_color_temp",
+    )
 
     client_type = config.get(CONF_NODE_TYPE)
     max_fps = config.get(CONF_NODE_MAX_FPS)
@@ -622,9 +635,6 @@ class DmxWhite(DmxBaseLight):
         self._output_correction_fn = None
         self._unsub_boost = None
         self._unsub_color_source = None
-        # Remembers a colour temperature the user picked by hand; the source is ignored while it is active.
-        self._manual_hold = ManualHold(kwargs.get(CONF_MANUAL_HOLD) or 0)
-        self._unsub_manual_timer = None
 
     @property
     def owns_output_correction(self) -> bool:
@@ -653,36 +663,8 @@ class DmxWhite(DmxBaseLight):
         data = super().extra_state_attributes
         data["mixing"] = self._effective_mixing()
         if self._color_temp_entity:
-            now = time.time()
             data["color_temp_source"] = self._color_temp_entity
-            data["manual_color"] = self._manual_hold.active(now)
-            # Only a timed hold is persisted (restored after a restart); "until off" is not.
-            data["manual_until"] = self._manual_hold.until if self._manual_hold.remaining(now) else None
         return data
-
-    def _manual_active(self) -> bool:
-        return self._manual_hold.active(time.time())
-
-    def _start_manual_hold(self) -> None:
-        """The user chose a colour temperature: keep it and come back to the source later."""
-        if not self._color_temp_entity:
-            return
-        self._manual_hold.start(time.time())
-        self._schedule_manual_timer()
-
-    def _schedule_manual_timer(self) -> None:
-        if self._unsub_manual_timer:
-            self._unsub_manual_timer()
-            self._unsub_manual_timer = None
-        remaining = self._manual_hold.remaining(time.time())
-        if remaining is None or self.hass is None:
-            return
-
-        async def _expired(_now) -> None:
-            self._unsub_manual_timer = None
-            await self._follow_color_source()
-
-        self._unsub_manual_timer = async_call_later(self.hass, remaining + 0.5, _expired)
 
     @property
     def color_temp_kelvin(self) -> int | None:
@@ -722,8 +704,7 @@ class DmxWhite(DmxBaseLight):
         if self._color_temp_entity:
             self._unsub_color_source = async_track_state_change_event(
                 self.hass, [self._color_temp_entity], self._color_source_changed)
-            self._schedule_manual_timer()
-            await self._follow_color_source()
+            self._follow_color_source()
 
     async def async_will_remove_from_hass(self) -> None:
         if self._unsub_boost:
@@ -732,28 +713,38 @@ class DmxWhite(DmxBaseLight):
         if self._unsub_color_source:
             self._unsub_color_source()
             self._unsub_color_source = None
-        if self._unsub_manual_timer:
-            self._unsub_manual_timer()
-            self._unsub_manual_timer = None
         await super().async_will_remove_from_hass()
 
     async def _color_source_changed(self, event) -> None:
         if event.data.get("new_state") is None:
             return
-        await self._follow_color_source()
+        self._follow_color_source()
 
-    async def _follow_color_source(self) -> None:
-        """Adopt the source colour temperature: silently while off, with a fade while on."""
-        if self._manual_active():
+    def _follow_color_source(self) -> None:
+        """While off, silently adopt the source colour temperature so the next turn_on starts with it.
+
+        While on, nothing happens here: the source (e.g. Adaptive Lighting) drives the light
+        through ordinary turn_on calls and keeps its own manual-control logic.
+        """
+        if self.is_on:
             return
         kelvin = self._source_kelvin()
         if kelvin is None or kelvin == self._vals:
             return
+        self._vals = kelvin
+        self.async_schedule_update_ha_state()
+
+    async def async_set_color_temp(self, color_temp_kelvin: int, brightness: int | None = None,
+                                   transition: float | None = None) -> None:
+        """Service artnet_led.set_color_temp: set colour temperature (and optionally brightness)
+        without turning the light on. A light that is on fades to the new values."""
+        self._vals = int(min(max(color_temp_kelvin, self._min_kelvin), self._max_kelvin))
+        if brightness is not None:
+            self._attr_brightness = brightness
         if self.is_on:
-            self._vals = kelvin
-            await self.async_create_fade(transition=self._fade_time)
+            kwargs = {} if transition is None else {ATTR_TRANSITION: transition}
+            await self.async_create_fade(**kwargs)
         else:
-            self._vals = kelvin
             self.async_schedule_update_ha_state()
 
     async def _boost_changed(self, event) -> None:
@@ -775,28 +766,16 @@ class DmxWhite(DmxBaseLight):
         old_values = self._vals
         old_brightness = self._attr_brightness
 
-        source_kelvin = self._source_kelvin()
-
         if ATTR_COLOR_TEMP_KELVIN in kwargs:
-            kelvin = kwargs[ATTR_COLOR_TEMP_KELVIN]
-            if is_from_source(kelvin, source_kelvin):
-                # The source itself (e.g. Adaptive Lighting adapting or intercepting a turn_on).
-                # While the user's own choice is being held, the source value is ignored.
-                if not self._manual_active():
-                    self._vals = kelvin
-            else:
-                # A deliberate choice: keep it for the configured hold time.
-                self._vals = kelvin
-                self._start_manual_hold()
+            self._vals = kwargs[ATTR_COLOR_TEMP_KELVIN]
 
         elif ATTR_WHITE in kwargs:
             self._vals = (self._max_kelvin + self._min_kelvin) / 2
             self._attr_brightness = kwargs[ATTR_WHITE]
-            self._start_manual_hold()
 
-        elif source_kelvin is not None and not self._manual_active():
-            # Plain turn_on: start right at the colour temperature the source currently wants.
-            self._vals = source_kelvin
+        elif not self.is_on:
+            # Plain turn_on from off: make sure we start with the source's current value.
+            self._follow_color_source()
 
         if ATTR_BRIGHTNESS in kwargs:
             self._attr_brightness = kwargs[ATTR_BRIGHTNESS]
@@ -808,10 +787,6 @@ class DmxWhite(DmxBaseLight):
 
         return None
 
-    async def async_turn_off(self, **kwargs):
-        self._manual_hold.on_turned_off()
-        await super().async_turn_off(**kwargs)
-
     async def restore_state(self, old_state):
         log.debug("Added color_temp to hass. Try restoring state.")
 
@@ -820,7 +795,6 @@ class DmxWhite(DmxBaseLight):
             self._vals = prev_vals
             prev_brightness = old_state.attributes.get('bright')
             self._attr_brightness = prev_brightness
-            self._manual_hold.restore(old_state.attributes.get('manual_until'), time.time())
 
         if old_state.state != STATE_OFF:
             await super().async_create_fade(brightness=self._attr_brightness, rgb_color=self._vals, transition=0)
@@ -1238,7 +1212,6 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
                             vol.Optional(CONF_COLOR_MIXING, default=MIXING_MAX_OUTPUT): vol.In(MIXING_MODES),
                             vol.Optional(CONF_BOOST_ENTITY): cv.entity_id,
                             vol.Optional(CONF_COLOR_TEMP_ENTITY): cv.entity_id,
-                            vol.Optional(CONF_MANUAL_HOLD, default=0): vol.All(vol.Coerce(int), vol.Range(min=0)),
                         }
                     ],
                 )

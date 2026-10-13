@@ -1,0 +1,39 @@
+set_color_temp:
+  name: Set color temperature
+  description: >-
+    Set the colour temperature (and optionally the brightness) of a color_temp light without
+    turning it on. A light that is off only stores the values and uses them on the next turn_on;
+    a light that is on fades to them.
+  target:
+    entity:
+      integration: artnet_led
+      domain: light
+  fields:
+    color_temp_kelvin:
+      name: Color temperature
+      description: Colour temperature in Kelvin, clamped to the light's range.
+      required: true
+      example: 3000
+      selector:
+        color_temp:
+          unit: kelvin
+          min: 1000
+          max: 20000
+    brightness:
+      name: Brightness
+      description: Brightness 1-255 to store or apply together with the colour temperature.
+      example: 204
+      selector:
+        number:
+          min: 1
+          max: 255
+    transition:
+      name: Transition
+      description: Fade time in seconds when the light is on. Defaults to the light's transition.
+      example: 1
+      selector:
+        number:
+          min: 0
+          max: 300
+          step: 0.1
+          unit_of_measurement: s
