@@ -38,6 +38,7 @@ from pyartnet.errors import UniverseNotFoundError
 from custom_components.artnet_led.bridge.artnet_controller import ArtNetController
 from custom_components.artnet_led.bridge.channel_bridge import ChannelBridge
 from custom_components.artnet_led.util.channel_switch import validate, to_values, from_values
+from custom_components.artnet_led.util.color_source import kelvin_from_state
 from custom_components.artnet_led.util.white_mixing import MIXING_MODES, MIXING_MAX_OUTPUT, MIXING_CONSTANT_LUMEN
 
 ARTNET_DEFAULT_PORT = 6454
@@ -68,6 +69,7 @@ CONF_DEVICE_MAX_TEMP = "max_temp"
 CONF_CHANNEL_SETUP = "channel_setup"
 CONF_COLOR_MIXING = "color_mixing"
 CONF_BOOST_ENTITY = "boost_entity"
+CONF_COLOR_TEMP_ENTITY = "color_temp_entity"
 
 DOMAIN = "dmx"
 
@@ -615,8 +617,12 @@ class DmxWhite(DmxBaseLight):
 
         self._mixing = kwargs.get(CONF_COLOR_MIXING) or MIXING_MAX_OUTPUT
         self._boost_entity = kwargs.get(CONF_BOOST_ENTITY)
+        self._color_temp_entity = kwargs.get(CONF_COLOR_TEMP_ENTITY)
         self._output_correction_fn = None
         self._unsub_boost = None
+        self._unsub_color_source = None
+        # True while the user picked a colour temperature by hand; the source is ignored until turned off.
+        self._manual_color = False
 
     @property
     def owns_output_correction(self) -> bool:
@@ -633,10 +639,20 @@ class DmxWhite(DmxBaseLight):
                 return MIXING_MAX_OUTPUT
         return self._mixing
 
+    def _source_kelvin(self) -> int | None:
+        """Colour temperature the configured source entity currently asks for, if any."""
+        if not self._color_temp_entity or self.hass is None:
+            return None
+        return kelvin_from_state(self.hass.states.get(self._color_temp_entity),
+                                 self._min_kelvin, self._max_kelvin)
+
     @property
     def extra_state_attributes(self):
         data = super().extra_state_attributes
         data["mixing"] = self._effective_mixing()
+        if self._color_temp_entity:
+            data["color_temp_source"] = self._color_temp_entity
+            data["manual_color"] = self._manual_color
         return data
 
     @property
@@ -674,12 +690,38 @@ class DmxWhite(DmxBaseLight):
         if self._boost_entity:
             self._unsub_boost = async_track_state_change_event(
                 self.hass, [self._boost_entity], self._boost_changed)
+        if self._color_temp_entity:
+            self._unsub_color_source = async_track_state_change_event(
+                self.hass, [self._color_temp_entity], self._color_source_changed)
+            await self._follow_color_source()
 
     async def async_will_remove_from_hass(self) -> None:
         if self._unsub_boost:
             self._unsub_boost()
             self._unsub_boost = None
+        if self._unsub_color_source:
+            self._unsub_color_source()
+            self._unsub_color_source = None
         await super().async_will_remove_from_hass()
+
+    async def _color_source_changed(self, event) -> None:
+        if event.data.get("new_state") is None:
+            return
+        await self._follow_color_source()
+
+    async def _follow_color_source(self) -> None:
+        """Adopt the source colour temperature: silently while off, with a fade while on."""
+        kelvin = self._source_kelvin()
+        if kelvin is None or kelvin == self._vals:
+            return
+        if self.is_on:
+            if self._manual_color:
+                return
+            self._vals = kelvin
+            await self.async_create_fade(transition=self._fade_time)
+        else:
+            self._vals = kelvin
+            self.async_schedule_update_ha_state()
 
     async def _boost_changed(self, event) -> None:
         """Re-send the current brightness and temperature with the new mixing when the boost switch flips."""
@@ -700,12 +742,22 @@ class DmxWhite(DmxBaseLight):
         old_values = self._vals
         old_brightness = self._attr_brightness
 
+        source_kelvin = self._source_kelvin()
+
         if ATTR_COLOR_TEMP_KELVIN in kwargs:
             self._vals = kwargs[ATTR_COLOR_TEMP_KELVIN]
+            # A temperature that differs from the source is a deliberate choice: stop following until off.
+            if source_kelvin is not None:
+                self._manual_color = self._vals != source_kelvin
 
         elif ATTR_WHITE in kwargs:
             self._vals = (self._max_kelvin + self._min_kelvin) / 2
             self._attr_brightness = kwargs[ATTR_WHITE]
+            self._manual_color = source_kelvin is not None
+
+        elif source_kelvin is not None and not (self.is_on and self._manual_color):
+            # Plain turn_on: start right at the colour temperature the source currently wants.
+            self._vals = source_kelvin
 
         if ATTR_BRIGHTNESS in kwargs:
             self._attr_brightness = kwargs[ATTR_BRIGHTNESS]
@@ -716,6 +768,10 @@ class DmxWhite(DmxBaseLight):
             await super().async_create_fade(**kwargs)
 
         return None
+
+    async def async_turn_off(self, **kwargs):
+        self._manual_color = False
+        await super().async_turn_off(**kwargs)
 
     async def restore_state(self, old_state):
         log.debug("Added color_temp to hass. Try restoring state.")
@@ -1141,6 +1197,7 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
                             ),
                             vol.Optional(CONF_COLOR_MIXING, default=MIXING_MAX_OUTPUT): vol.In(MIXING_MODES),
                             vol.Optional(CONF_BOOST_ENTITY): cv.entity_id,
+                            vol.Optional(CONF_COLOR_TEMP_ENTITY): cv.entity_id,
                         }
                     ],
                 )

@@ -215,6 +215,8 @@ For `color_temp` lights the integration can mix cold white and warm white in two
 
 - **`boost_entity`** (optional): an entity, usually an `input_boolean`, that temporarily switches the light to `max_output` while it is `on`. Point several lights at the same helper to get a house-wide "full power" / cleaning light switch; lights that are on fade to the new mix immediately.
 
+- **`color_temp_entity`** (optional): an entity whose colour temperature the light follows (human centric lighting). The source can be a numeric entity in Kelvin (`sensor`, `input_number`) or any entity with a `color_temp_kelvin` attribute, e.g. `switch.adaptive_lighting_default` or another light. While the light is **off** the new temperature is stored silently, so a plain `light.turn_on` starts right at the current value instead of the one from the last session. While the light is **on** it fades to every change. Turning the light on with an explicit `color_temp_kelvin` that differs from the source counts as a manual choice: the source is ignored until the light is switched off again (`manual_color` attribute). If you use Adaptive Lighting, you can remove the light from its `lights` list and let the switch act as a pure source.
+
 ```yaml
 - channel: 3
   name: ceiling_cct
@@ -225,6 +227,7 @@ For `color_temp` lights the integration can mix cold white and warm white in two
   output_correction: quadratic
   color_mixing: constant_lumen
   boost_entity: input_boolean.cleaning_light
+  color_temp_entity: switch.adaptive_lighting_default
 ```
 
 The `rgbww` type is not affected by this setting.
