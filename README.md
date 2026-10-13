@@ -215,7 +215,11 @@ For `color_temp` lights the integration can mix cold white and warm white in two
 
 - **`boost_entity`** (optional): an entity, usually an `input_boolean`, that temporarily switches the light to `max_output` while it is `on`. Point several lights at the same helper to get a house-wide "full power" / cleaning light switch; lights that are on fade to the new mix immediately.
 
-- **`color_temp_entity`** (optional): an entity whose colour temperature the light follows (human centric lighting). The source can be a numeric entity in Kelvin (`sensor`, `input_number`) or any entity with a `color_temp_kelvin` attribute, e.g. `switch.adaptive_lighting_default` or another light. While the light is **off** the new temperature is stored silently, so a plain `light.turn_on` starts right at the current value instead of the one from the last session. While the light is **on** it fades to every change. Turning the light on with an explicit `color_temp_kelvin` that differs from the source counts as a manual choice: the source is ignored until the light is switched off again (`manual_color` attribute). If you use Adaptive Lighting, you can remove the light from its `lights` list and let the switch act as a pure source.
+- **`color_temp_entity`** (optional): an entity whose colour temperature the light follows in the background (human centric lighting). The source can be a numeric entity in Kelvin (`sensor`, `input_number`) or any entity with a `color_temp_kelvin` attribute, e.g. `switch.adaptive_lighting_default` or another light. While the light is **off** the new temperature is only stored, so a plain `light.turn_on` starts right at the current value instead of the one from the last session. While the light is **on** it fades to every change of the source.
+
+- **`manual_hold`** (optional, seconds, default `0`): what happens after you pick a colour temperature yourself (a `turn_on` with a `color_temp_kelvin` that differs from the source). The light keeps your choice and ignores the source for this many seconds, **also across off/on and restarts**; afterwards it returns to the source (with a fade if it is on). With `0` the choice is kept until the light is turned off. The attributes `manual_color` and `manual_until` show the state. A `turn_on` whose colour temperature matches the source (±25 K) is treated as coming from the source, so Adaptive Lighting injecting its value into an intercepted `turn_on` does not count as a manual choice and cannot break a running hold.
+
+  Note for Adaptive Lighting users: AL clears its own manual control as soon as a light is turned off and adapts it again on the next turn-on. `manual_hold` is what keeps your colour across that. You can leave the light in AL's `lights` list (AL then still adapts the brightness) or remove it and use the switch purely as a source.
 
 ```yaml
 - channel: 3
@@ -228,6 +232,7 @@ For `color_temp` lights the integration can mix cold white and warm white in two
   color_mixing: constant_lumen
   boost_entity: input_boolean.cleaning_light
   color_temp_entity: switch.adaptive_lighting_default
+  manual_hold: 36000         # keep a manual colour choice for 10 h, like AL's autoreset
 ```
 
 The `rgbww` type is not affected by this setting.
